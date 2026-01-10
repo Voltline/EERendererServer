@@ -9,7 +9,7 @@ API_SECRET = "secret"
 ROOM_NAME = "my-room"
 
 WIDTH = 1920
-HEIGHT = 1080
+HEIGHT = 2160
 
 # I420 = Y plane (W*H) + U (W*H/4) + V (W*H/4) = W*H*3/2
 FRAME_SIZE = WIDTH * HEIGHT * 3 // 2
@@ -18,7 +18,7 @@ gst_exe = r"C:/Program Files/gstreamer/1.0/msvc_x86_64/bin/gst-launch-1.0"
 
 GST_CMD = [
     gst_exe, "-q",
-    "zedsrc", "camera-resolution=1", "camera-fps=30", "stream-type=0", "!",
+    "zedsrc", "camera-resolution=1", "camera-fps=30", "stream-type=2", "!",
     "videoconvert", "!",
     f"video/x-raw,format=I420,width={WIDTH},height={HEIGHT},framerate=30/1", "!",
     "tcpserversink", "host=127.0.0.1", "port=8888", "sync=false"

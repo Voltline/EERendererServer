@@ -6,3 +6,7 @@ gst-launch-1.0 -e -v `
   video/x-h264,profile=constrained-baseline,stream-format=byte-stream ! `
   h264parse config-interval=1 ! `
   tcpserversink host=0.0.0.0 port=16400 recover-policy=keyframe sync-method=latest-keyframe
+
+livekit-server.exe --dev --bind 0.0.0.0
+
+lk token create --api-key devkey --api-secret secret --join --room my-room --identity vision-pro-viewer --valid-for 24h
