@@ -7,15 +7,17 @@ class GimbalController:
     def __init__(
         self,
         driver,
-        center_pos: int = 2048,
-        yaw_range_rad: float = math.pi / 2,
-        pitch_range_rad: float = math.pi / 4,
-        yaw_range_ticks: int = 1024,
-        pitch_range_ticks: int = 512,
+        yaw_center_pos: int = 3000,
+        pitch_center_pos: int = 2048,
+        yaw_range_rad: float = math.pi,
+        pitch_range_rad: float = math.pi / 2,
+        yaw_range_ticks: int = 2000,
+        pitch_range_ticks: int = 1100,
     ):
         """
         :param driver: DynamixelDriver 实例
-        :param center_pos: 云台中位（通常是 2048）
+        :param yaw_center_pos: yaw 中位
+        :param pitch_center_pos: pitch 中位
         :param yaw_range_rad: yaw 最大角度范围（弧度，±）
         :param pitch_range_rad: pitch 最大角度范围（弧度，±）
         :param yaw_range_ticks: yaw 对应的 Dynamixel 刻度范围（±）
@@ -23,7 +25,8 @@ class GimbalController:
         """
         self.driver = driver
 
-        self.center_pos = center_pos
+        self.yaw_center_pos = yaw_center_pos
+        self.pitch_center_pos = pitch_center_pos
 
         self.yaw_range_rad = yaw_range_rad
         self.pitch_range_rad = pitch_range_rad
@@ -50,17 +53,17 @@ class GimbalController:
         )
 
         yaw_pos = int(
-            self.center_pos
+            self.yaw_center_pos
             + yaw_rad / self.yaw_range_rad * self.yaw_range_ticks
         )
 
         pitch_pos = int(
-            self.center_pos
+            self.pitch_center_pos
             + pitch_rad / self.pitch_range_rad * self.pitch_range_ticks
         )
 
-        yaw_pos = self._clamp(yaw_pos, 0, 4095)
-        pitch_pos = self._clamp(pitch_pos, 0, 4095)
+        yaw_pos = self._clamp(yaw_pos, 2000, 4000)
+        pitch_pos = self._clamp(pitch_pos, 1800, 2900)
 
         self.driver.set_position(
             horizontal_pos=yaw_pos,
@@ -79,6 +82,7 @@ if __name__ == "__main__":
         DynamixelDriver(device)
     )
     controller.set_yaw_pitch(0, 0)
+    time.sleep(2)
 
     amplitude = math.pi  # 左右最大 ±45°
     period = 4.0  # 4 秒一个完整来回
