@@ -21,7 +21,7 @@ GST_CMD = [
     "zedsrc", "camera-resolution=1", "camera-fps=30", "stream-type=2", "!",
     "videoconvert", "!",
     f"video/x-raw,format=I420,width={WIDTH},height={HEIGHT},framerate=30/1", "!",
-    "tcpserversink", "host=127.0.0.1", "port=8888", "sync=false"
+    "tcpserversink", "host=127.0.0.1", "port=40000", "sync=false"
 ]
 
 async def main():
@@ -33,7 +33,7 @@ async def main():
         return
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect(("127.0.0.1", 8888))
+    sock.connect(("127.0.0.1", 40000))
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     room = rtc.Room()

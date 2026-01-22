@@ -9,4 +9,4 @@ gst-launch-1.0 -e -v `
 
 livekit-server.exe --dev --bind 0.0.0.0
 
-lk token create --api-key devkey --api-secret secret --join --room my-room --identity vision-pro-viewer --valid-for 24h
+lk token create --api-key devkey --api-secret secret --join --room my-room --identity test_viewer --valid-for 24h
