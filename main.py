@@ -359,6 +359,26 @@ def get_panorama():
 def scan_status():
     return jsonify({"scanning": is_scanning})
 
+@app.route("/gimbal/delta", methods=["POST"])
+def gimbal_delta():
+    global current_yaw, current_pitch
+
+    data = request.get_json(force=True)
+
+    delta_yaw = float(data.get("delta_yaw", 0.0))
+    delta_pitch = float(data.get("delta_pitch", 0.0))
+    print(delta_yaw, delta_pitch)
+
+    with state_lock:
+        current_yaw += delta_yaw
+        current_pitch += delta_pitch
+
+        controller.set_yaw_pitch(current_yaw, current_pitch)
+
+    return jsonify({
+        "yaw": current_yaw,
+        "pitch": current_pitch
+    })
 
 # ============ Flask 启动器 ============
 def run_flask():
@@ -369,21 +389,21 @@ def run_flask():
 async def main():
     global latest_frame
 
-    # 启动 Flask (后台线程)
+    # 1. 启动 Flask (后台线程)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print("[Main] Flask API ready at :30000")
 
-    # 启动 GStreamer
+    # 2. 启动 GStreamer
     print("[Main] Launching GStreamer...")
     gst_process = subprocess.Popen(GST_CMD)
-    await asyncio.sleep(3) # 等待 GStreamer 预热
+    await asyncio.sleep(3)  # 等待 GStreamer 预热
 
     if gst_process.poll() is not None:
         print("[Main] GStreamer failed to start.")
         return
 
-    # 建立 TCP 数据连接
+    # 3. 建立 TCP 数据连接
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.connect(("127.0.0.1", 40000))
@@ -394,7 +414,7 @@ async def main():
         gst_process.kill()
         return
 
-    # 连接 LiveKit
+    # 4. 连接 LiveKit
     print("[Main] Connecting to LiveKit...")
     room = rtc.Room()
     grants = api.VideoGrants(
@@ -418,8 +438,21 @@ async def main():
     # 发布视频轨道
     source = rtc.VideoSource(WIDTH, HEIGHT)
     track = rtc.LocalVideoTrack.create_video_track("zed_source", source)
+
+    # 显式配置推流参数
+    options = rtc.TrackPublishOptions(
+        source=rtc.TrackSource.SOURCE_CAMERA,
+        video_codec=rtc.VideoCodec.H264,  # 强制 H.264
+        video_encoding=rtc.VideoEncoding(
+            max_framerate=30,
+            max_bitrate=6_000_000  # 6 Mbps
+        ),
+    )
+
     if room.isconnected:
-        await room.local_participant.publish_track(track)
+        print("[Main] Publishing track with options...")
+        await room.local_participant.publish_track(track, options)
+        print("[Main] Track published!")
 
     # 主循环：读取流 -> 更新全局帧 -> 推流
     buffer = bytearray()
@@ -429,6 +462,8 @@ async def main():
         while True:
             # 读取刚好一帧的大小
             while len(buffer) < FRAME_SIZE:
+                # 注意：sock.recv 是阻塞调用，在极高负载下可能会稍微卡顿 asyncio
+                # 但在 localhost 环境下通常够快。如果还卡，需要改写为 non-blocking。
                 chunk = sock.recv(FRAME_SIZE - len(buffer))
                 if not chunk:
                     raise RuntimeError("Stream closed")
