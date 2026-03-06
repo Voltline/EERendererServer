@@ -1,13 +1,13 @@
 from dynamixel_sdk import *  # 官方 Dynamixel SDK
 
-# ===== 基本参数（与你的 OpenTeleVision 完全一致）=====
+# ===== 基本参数（与 OpenTeleVision 完全一致）=====
 DEVICENAME = "COM3"
 BAUDRATE = 57600
 PROTOCOL_VERSION = 2.0
 
 DXL_IDS = [10, 11]
 
-# ===== Control Table（Protocol 2.0 通用）=====
+# ===== Control Table =====
 ADDR_TORQUE_ENABLE    = 64
 ADDR_GOAL_POSITION    = 116
 ADDR_PRESENT_POSITION = 132
@@ -38,7 +38,7 @@ for dxl_id in DXL_IDS:
         print(f"ID {dxl_id} 已使能")
 
 # ===== 写一个测试位置 =====
-# 注意：4096 = 一圈（Protocol 2.0 典型配置）
+# 4096 = 一圈
 goal_positions = {
     10: 2048,
     11: 3072,
