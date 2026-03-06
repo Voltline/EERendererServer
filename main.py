@@ -90,9 +90,9 @@ _3dgs_jobs_lock = threading.Lock()
 _mock_operations = {}
 _mock_operations_lock = threading.Lock()
 # Mock 模拟生成时间 (秒)
-MOCK_GENERATION_TIME = int(os.environ.get("WLT_MOCK_TIME", "30"))
+MOCK_GENERATION_TIME = int(os.environ.get("WLT_MOCK_TIME", "15"))
 
-# ============ Flask 应用 ============
+# ============ Flask 应用 ============ ,ml;
 app = Flask(__name__)
 swagger_config = {
     "headers": [],
@@ -245,30 +245,30 @@ def gimbal_set():
 
 # ============ 3DGS 多图采集 ============
 
-def capture_4frame_sequence():
-    """执行 4 帧水平扫描，用于 multi-image 3DGS 生成
-    yaw 角度: -90°, -30°, 30°, 90°
-    返回: [{"img": ndarray, "yaw_deg": float, "azimuth": float}, ...]
+SCAN_FRAME_COUNT = 8  # 扫描帧数 (均匀分布在 -90°~90° 范围)
+
+
+def capture_multiframe_sequence(n_frames: int = SCAN_FRAME_COUNT):
+    """执行多帧水平扫描，用于 multi-image 3DGS 生成
+    在 -90°~90° 范围内均匀采集 n_frames 帧 (不传 azimuth，由模型自动推断)。
+    返回: [{"img": ndarray, "yaw_deg": float}, ...]
     """
     if controller is None:
         print("[3DGS] 云台未连接，无法执行扫描")
         return []
 
     captured = []
-    # 4 个水平角度 (yaw degrees) 及对应 azimuth (World Labs 方位角, 0=正前)
-    scan_positions = [
-        {"yaw_deg": -90, "azimuth": 270},  # 左
-        {"yaw_deg": -30, "azimuth": 330},  # 左前
-        {"yaw_deg":  30, "azimuth":  30},  # 右前
-        {"yaw_deg":  90, "azimuth":  90},  # 右
+    # 在 [-90, 90] 范围内均匀分布 n_frames 个角度
+    yaw_positions = [
+        -90.0 + i * 180.0 / (n_frames - 1) for i in range(n_frames)
     ]
 
-    print(f"[3DGS] 开始 4 帧水平扫描...")
+    print(f"[3DGS] 开始 {n_frames} 帧水平扫描 (yaw: {yaw_positions[0]:.0f}°~{yaw_positions[-1]:.0f}°)...")
     init_gimbal_sync()
     time.sleep(1.0)
 
-    for i, pos in enumerate(scan_positions):
-        yaw_rad = math.radians(pos["yaw_deg"])
+    for i, yaw_deg in enumerate(yaw_positions):
+        yaw_rad = math.radians(yaw_deg)
         set_gimbal_sync(yaw_rad, 0.0)  # pitch 固定 0
         time.sleep(0.6)  # 等待机械稳定
 
@@ -282,15 +282,14 @@ def capture_4frame_sequence():
         if frame is not None:
             captured.append({
                 "img": frame.copy(),
-                "yaw_deg": pos["yaw_deg"],
-                "azimuth": pos["azimuth"],
+                "yaw_deg": yaw_deg,
             })
-            print(f"  -> [{i+1}/4] OK (yaw={pos['yaw_deg']}°, azimuth={pos['azimuth']}°)")
+            print(f"  -> [{i+1}/{n_frames}] OK (yaw={yaw_deg:.1f}°)")
         else:
-            print(f"  -> [{i+1}/4] 丢帧 (yaw={pos['yaw_deg']}°)")
+            print(f"  -> [{i+1}/{n_frames}] 丢帧 (yaw={yaw_deg:.1f}°)")
 
     init_gimbal_sync()
-    print(f"[3DGS] 扫描完成，采集到 {len(captured)}/4 帧")
+    print(f"[3DGS] 扫描完成，采集到 {len(captured)}/{n_frames} 帧")
     return captured
 
 
@@ -364,7 +363,7 @@ def _run_3dgs_job_real(job_id: str, display_name: str, text_prompt: str, model: 
         with _3dgs_jobs_lock:
             _3dgs_jobs[job_id]["status"] = "SCANNING"
 
-        frames = capture_4frame_sequence()
+        frames = capture_multiframe_sequence()
         if not frames:
             with _3dgs_jobs_lock:
                 _3dgs_jobs[job_id]["status"] = "FAILED"
@@ -375,20 +374,25 @@ def _run_3dgs_job_real(job_id: str, display_name: str, text_prompt: str, model: 
         with _3dgs_jobs_lock:
             _3dgs_jobs[job_id]["status"] = "UPLOADING"
 
-        # 构建 multi-image prompt
+        # 构建 multi-image prompt (新版 API 使用嵌套 content + discriminator)
+        # azimuth = yaw_deg % 360 (World Labs: 0°=正前, 顺时针)
         multi_image_items = []
         for f in frames:
             b64 = _encode_frame_to_base64_jpg(f["img"])
             multi_image_items.append({
-                "azimuth": f["azimuth"],
-                "data_base64": b64,
-                "extension": "jpg",
+                "azimuth": f["yaw_deg"] % 360,
+                "content": {
+                    "source": "data_base64",
+                    "data_base64": b64,
+                    "extension": "jpg",
+                },
             })
 
         body = {
             "world_prompt": {
                 "type": "multi-image",
                 "multi_image_prompt": multi_image_items,
+                "reconstruct_images": True,
             },
             "model": model,
         }
@@ -413,8 +417,10 @@ def _run_3dgs_job_real(job_id: str, display_name: str, text_prompt: str, model: 
             return
 
         result = resp.json()
+        print(f"[3DGS] API 返回: {str(result)[:500]}")
         operation_id = result.get("operation_id", "")
-        world_id = result.get("metadata", {}).get("world_id", "")
+        metadata = result.get("metadata") or {}
+        world_id = metadata.get("world_id", "")
 
         with _3dgs_jobs_lock:
             _3dgs_jobs[job_id]["status"] = "SUBMITTED"
@@ -450,8 +456,8 @@ def scan_3dgs():
     tags:
       - 3DGS
     description: |
-      触发 4 帧水平扫描 → base64 编码 → 提交 World Labs multi-image 生成。
-      完全异步执行，立即返回 job_id。
+      触发 8 帧水平扫描 (-90°~90° 均匀分布) → base64 编码 → 提交 World Labs multi-image 生成。
+      完全异步执行，立即返回 job_id。不传 azimuth，由模型自动推断视角。
 
       **完整流程:**
       1. `POST /scan/3dgs` → 获取 job_id
