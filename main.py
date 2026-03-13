@@ -81,6 +81,15 @@ latest_frame = None
 is_scanning = False
 scan_lock = threading.Lock()
 
+# ============ 视频下行时延实测标记 ============
+latency_video_stamp_enabled = False
+latency_video_stamp_lock = threading.Lock()
+STAMP_SYNC_BITS = [1, 0, 1, 0, 1, 0, 1, 0]
+STAMP_BLOCK_W = 4
+STAMP_BLOCK_H = 4
+STAMP_LOW = 30
+STAMP_HIGH = 220
+
 # ============ 3DGS 任务状态管理 ============
 # job 状态: SCANNING -> UPLOADING -> SUBMITTED -> COMPLETED / FAILED
 _3dgs_jobs = {}  # job_id -> { status, operation_id, world_id, error, created_at }
@@ -152,6 +161,32 @@ def get_current_frame_bgr() -> np.ndarray:
     # ZED stream-type=2 上下堆叠：上半部分是左眼 (1920x1080)
     left_frame = bgr[:HEIGHT // 2, :]
     return left_frame
+
+
+def stamp_latency_bits_i420(frame_data: bytearray, width: int, height: int, unix_ms: int) -> bool:
+    """将服务器发送时刻写入 I420 的 Y 平面顶端块中，用于客户端直接解码视频下行时延。
+
+    编码格式: 8bit 同步头 + 48bit unix_ms (ms)
+    """
+    total_bits = 8 + 48
+    needed_w = total_bits * STAMP_BLOCK_W
+    if width < needed_w or height < STAMP_BLOCK_H:
+        return False
+
+    value_48 = int(unix_ms) & ((1 << 48) - 1)
+    payload_bits = [
+        (value_48 >> (47 - i)) & 1 for i in range(48)
+    ]
+    bits = STAMP_SYNC_BITS + payload_bits
+
+    for bit_idx, bit in enumerate(bits):
+        y_val = STAMP_HIGH if bit else STAMP_LOW
+        x0 = bit_idx * STAMP_BLOCK_W
+        for row in range(STAMP_BLOCK_H):
+            row_offset = row * width + x0
+            frame_data[row_offset:row_offset + STAMP_BLOCK_W] = bytes([y_val]) * STAMP_BLOCK_W
+
+    return True
 
 
 def set_gimbal_sync(yaw: float, pitch: float):
@@ -1169,7 +1204,7 @@ def get_panorama():
         pano_img = generate_equirectangular(frames)
 
         if pano_img is None:
-             return jsonify({"error": "Stitching failed"}), 500
+            return jsonify({"error": "Stitching failed"}), 500
 
         success, buffer = cv2.imencode('.jpg', pano_img, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
 
@@ -1205,6 +1240,64 @@ def scan_status():
     """
     return jsonify({"scanning": is_scanning})
 
+
+@app.route("/latency/ping", methods=["GET"])
+def latency_ping():
+    """时延探测心跳
+    ---
+    tags:
+      - 云台
+    description: 轻量接口，用于客户端估计网络 RTT 与单向通信时延。
+    responses:
+      200:
+        description: 服务端时间信息
+        schema:
+          type: object
+          properties:
+            server_unix_ms:
+              type: number
+            t_server_proc_ms:
+              type: number
+    """
+    t0 = time.perf_counter_ns()
+    response = {
+        "server_unix_ms": round(time.time() * 1000.0, 3),
+    }
+    response["t_server_proc_ms"] = round((time.perf_counter_ns() - t0) / 1_000_000.0, 3)
+    return jsonify(response)
+
+
+@app.route("/latency/video_stamp", methods=["POST"])
+def latency_video_stamp():
+    """启停视频帧时延标记
+    ---
+    tags:
+      - 云台
+    description: 开启后，服务端会把发送时刻写入视频帧 Y 平面，供客户端直接测量 T_video_down。
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+              example: true
+    responses:
+      200:
+        description: 当前开关状态
+    """
+    global latency_video_stamp_enabled
+
+    data = request.get_json(force=True) if request.data else {}
+    enabled = bool(data.get("enabled", False))
+
+    with latency_video_stamp_lock:
+        latency_video_stamp_enabled = enabled
+
+    return jsonify({"enabled": latency_video_stamp_enabled})
+
 @app.route("/gimbal/delta", methods=["POST"])
 def gimbal_delta():
     """增量调整云台角度
@@ -1238,6 +1331,7 @@ def gimbal_delta():
               type: number
     """
     global current_yaw, current_pitch
+    req_start_ns = time.perf_counter_ns()
 
     data = request.get_json(force=True)
 
@@ -1245,15 +1339,28 @@ def gimbal_delta():
     delta_pitch = float(data.get("delta_pitch", 0.0))
     print(delta_yaw, delta_pitch)
 
+    mech_start_ns = 0
+    mech_end_ns = 0
+
     with state_lock:
         current_yaw += delta_yaw
         current_pitch += delta_pitch
 
-        controller.set_yaw_pitch(current_yaw, current_pitch)
+        mech_start_ns = time.perf_counter_ns()
+        if controller is not None:
+            controller.set_yaw_pitch(current_yaw, current_pitch)
+        mech_end_ns = time.perf_counter_ns()
+
+    resp_ready_ns = time.perf_counter_ns()
+    t_mechanical_ms = (mech_end_ns - mech_start_ns) / 1_000_000.0
+    t_server_proc_ms = (resp_ready_ns - req_start_ns) / 1_000_000.0
 
     return jsonify({
         "yaw": current_yaw,
-        "pitch": current_pitch
+        "pitch": current_pitch,
+        "t_mechanical_ms": round(t_mechanical_ms, 3),
+        "t_server_proc_ms": round(t_server_proc_ms, 3),
+        "server_recv_unix_ms": round(time.time() * 1000.0, 3),
     })
 
 # ============ Flask 启动器 ============
@@ -1353,8 +1460,18 @@ async def main():
                 buffer.extend(chunk)
 
             # 提取一帧
-            frame_data = buffer[:FRAME_SIZE]
+            frame_data = bytearray(buffer[:FRAME_SIZE])
             del buffer[:FRAME_SIZE]
+
+            with latency_video_stamp_lock:
+                stamp_enabled = latency_video_stamp_enabled
+            if stamp_enabled:
+                stamp_latency_bits_i420(
+                    frame_data,
+                    WIDTH,
+                    HEIGHT,
+                    int(time.time() * 1000.0),
+                )
 
             # 更新全局帧 (供 HTTP 全景扫描使用)
             with latest_frame_lock:
@@ -1365,7 +1482,7 @@ async def main():
                 frame = rtc.VideoFrame(
                     width=WIDTH, height=HEIGHT,
                     type=rtc.VideoBufferType.I420,
-                    data=frame_data,
+                  data=bytes(frame_data),
                 )
                 source.capture_frame(frame)
 
