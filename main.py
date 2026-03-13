@@ -3,7 +3,7 @@
 端口: 30000 (HTTP API), 40000 (GStreamer TCP), 7880 (LiveKit)
 """
 import asyncio
-import csv
+import sqlite3
 import subprocess
 import socket
 import threading
@@ -92,12 +92,11 @@ STAMP_LOW = 30
 STAMP_HIGH = 220
 
 # ============ 时延测试汇总落盘 ============
-LATENCY_REPORT_BASE = os.environ.get(
-    "LATENCY_REPORT_CSV",
-    os.path.join(os.path.dirname(__file__), "mtp_latency_reports.csv"),
+LATENCY_REPORT_DB = os.environ.get(
+  "LATENCY_REPORT_DB",
+  os.path.join(os.path.dirname(__file__), "mtp_latency_reports.db"),
 )
-LATENCY_REPORT_DIR = os.path.dirname(LATENCY_REPORT_BASE) or "."
-LATENCY_REPORT_PREFIX = os.path.splitext(os.path.basename(LATENCY_REPORT_BASE))[0]
+LATENCY_REPORT_TABLE = "latency_reports"
 latency_report_lock = threading.Lock()
 LATENCY_REPORT_FIELDS = [
     "report_id",
@@ -230,37 +229,87 @@ def _as_int(value, default=0):
         return default
 
 
-def _build_latency_report_filepath(server_received_unix_ms: float, report_id: str) -> str:
-    sec = int(server_received_unix_ms // 1000)
-    ms = int(server_received_unix_ms % 1000)
-    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(sec))
-    short_id = (report_id or str(uuid.uuid4())).split("-")[0]
-    filename = f"{LATENCY_REPORT_PREFIX}_{ts}_{ms:03d}_{short_id}.csv"
-    return os.path.join(LATENCY_REPORT_DIR, filename)
+def _get_latency_report_conn() -> sqlite3.Connection:
+  os.makedirs(os.path.dirname(LATENCY_REPORT_DB) or ".", exist_ok=True)
+  return sqlite3.connect(LATENCY_REPORT_DB, timeout=5.0)
 
 
-def append_latency_report_csv(record: dict) -> str:
-    os.makedirs(LATENCY_REPORT_DIR, exist_ok=True)
-    server_received_unix_ms = _as_float(record.get("server_received_unix_ms"), time.time() * 1000.0)
-    report_id = str(record.get("report_id", ""))
-    file_path = _build_latency_report_filepath(server_received_unix_ms, report_id)
+def init_latency_report_db():
+  with _get_latency_report_conn() as conn:
+    conn.execute(
+      f"""
+      CREATE TABLE IF NOT EXISTS {LATENCY_REPORT_TABLE} (
+        report_id TEXT PRIMARY KEY,
+        server_received_unix_ms REAL NOT NULL,
+        client_timestamp_unix_ms REAL,
+        mode TEXT,
+        duration_sec REAL,
+        cmd_count INTEGER,
+        mech_count INTEGER,
+        video_count INTEGER,
+        render_count INTEGER,
+        t_cmd_mean_ms REAL,
+        t_mech_mean_ms REAL,
+        t_video_mean_ms REAL,
+        t_render_mean_ms REAL,
+        t_mtp_mean_ms REAL,
+        t_mtp_p95_ms REAL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+      """
+    )
+    conn.execute(
+      f"CREATE INDEX IF NOT EXISTS idx_{LATENCY_REPORT_TABLE}_server_time "
+      f"ON {LATENCY_REPORT_TABLE}(server_received_unix_ms)"
+    )
 
-    with open(file_path, "w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=LATENCY_REPORT_FIELDS)
-        writer.writeheader()
-        writer.writerow({k: record.get(k, "") for k in LATENCY_REPORT_FIELDS})
 
-    return file_path
+def insert_latency_report(record: dict):
+  with _get_latency_report_conn() as conn:
+    conn.execute(
+      f"""
+      INSERT INTO {LATENCY_REPORT_TABLE} (
+        report_id,
+        server_received_unix_ms,
+        client_timestamp_unix_ms,
+        mode,
+        duration_sec,
+        cmd_count,
+        mech_count,
+        video_count,
+        render_count,
+        t_cmd_mean_ms,
+        t_mech_mean_ms,
+        t_video_mean_ms,
+        t_render_mean_ms,
+        t_mtp_mean_ms,
+        t_mtp_p95_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      """,
+      (
+        str(record.get("report_id", str(uuid.uuid4()))),
+        _as_float(record.get("server_received_unix_ms"), 0.0),
+        _as_float(record.get("client_timestamp_unix_ms"), 0.0),
+        str(record.get("mode", "panorama")),
+        _as_float(record.get("duration_sec"), 0.0),
+        _as_int(record.get("cmd_count"), 0),
+        _as_int(record.get("mech_count"), 0),
+        _as_int(record.get("video_count"), 0),
+        _as_int(record.get("render_count"), 0),
+        _as_float(record.get("t_cmd_mean_ms"), 0.0),
+        _as_float(record.get("t_mech_mean_ms"), 0.0),
+        _as_float(record.get("t_video_mean_ms"), 0.0),
+        _as_float(record.get("t_render_mean_ms"), 0.0),
+        _as_float(record.get("t_mtp_mean_ms"), 0.0),
+        _as_float(record.get("t_mtp_p95_ms"), 0.0),
+      ),
+    )
 
 
 def count_latency_reports() -> int:
-    if not os.path.isdir(LATENCY_REPORT_DIR):
-        return 0
-    total = 0
-    for name in os.listdir(LATENCY_REPORT_DIR):
-        if name.startswith(f"{LATENCY_REPORT_PREFIX}_") and name.endswith(".csv"):
-            total += 1
-    return total
+  with _get_latency_report_conn() as conn:
+    row = conn.execute(f"SELECT COUNT(*) FROM {LATENCY_REPORT_TABLE}").fetchone()
+  return int(row[0]) if row else 0
 
 
 def set_gimbal_sync(yaw: float, pitch: float):
@@ -1379,7 +1428,7 @@ def latency_report():
     ---
     tags:
       - 云台
-    description: 客户端在一次固定时长测试结束后，将汇总结果提交到服务端；服务端每次请求创建一个新的时间戳 CSV 文件。
+    description: 客户端在一次固定时长测试结束后，将汇总结果提交到服务端并写入 SQLite。
     parameters:
       - in: body
         name: body
@@ -1441,14 +1490,15 @@ def latency_report():
     }
 
     with latency_report_lock:
-        csv_path = append_latency_report_csv(record)
+        init_latency_report_db()
+        insert_latency_report(record)
         total = count_latency_reports()
 
     return jsonify({
         "ok": True,
         "report_id": record["report_id"],
         "total_reports": total,
-        "csv_path": os.path.abspath(csv_path),
+        "db_path": os.path.abspath(LATENCY_REPORT_DB),
     })
 
 @app.route("/gimbal/delta", methods=["POST"])

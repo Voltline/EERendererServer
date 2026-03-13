@@ -1,0 +1,2 @@
+report_id,server_received_unix_ms,client_timestamp_unix_ms,mode,duration_sec,cmd_count,mech_count,video_count,render_count,t_cmd_mean_ms,t_mech_mean_ms,t_video_mean_ms,t_render_mean_ms,t_mtp_mean_ms,t_mtp_p95_ms
+bc36fa44-a0ed-4999-ab0a-74aeb13358ab,1773378639822.383,1773378638384.39,panorama,30.025543459,300,300,200,300,16.68645317666667,31.99950000000001,143.0986058422656,2.757843059999999,194.5424020789323,231.29138378125
