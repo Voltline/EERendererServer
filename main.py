@@ -3,6 +3,7 @@
 端口: 30000 (HTTP API), 40000 (GStreamer TCP), 7880 (LiveKit)
 """
 import asyncio
+import csv
 import subprocess
 import socket
 import threading
@@ -89,6 +90,32 @@ STAMP_BLOCK_W = 4
 STAMP_BLOCK_H = 4
 STAMP_LOW = 30
 STAMP_HIGH = 220
+
+# ============ 时延测试汇总落盘 ============
+LATENCY_REPORT_BASE = os.environ.get(
+    "LATENCY_REPORT_CSV",
+    os.path.join(os.path.dirname(__file__), "mtp_latency_reports.csv"),
+)
+LATENCY_REPORT_DIR = os.path.dirname(LATENCY_REPORT_BASE) or "."
+LATENCY_REPORT_PREFIX = os.path.splitext(os.path.basename(LATENCY_REPORT_BASE))[0]
+latency_report_lock = threading.Lock()
+LATENCY_REPORT_FIELDS = [
+    "report_id",
+    "server_received_unix_ms",
+    "client_timestamp_unix_ms",
+    "mode",
+    "duration_sec",
+    "cmd_count",
+    "mech_count",
+    "video_count",
+    "render_count",
+    "t_cmd_mean_ms",
+    "t_mech_mean_ms",
+    "t_video_mean_ms",
+    "t_render_mean_ms",
+    "t_mtp_mean_ms",
+    "t_mtp_p95_ms",
+]
 
 # ============ 3DGS 任务状态管理 ============
 # job 状态: SCANNING -> UPLOADING -> SUBMITTED -> COMPLETED / FAILED
@@ -187,6 +214,53 @@ def stamp_latency_bits_i420(frame_data: bytearray, width: int, height: int, unix
             frame_data[row_offset:row_offset + STAMP_BLOCK_W] = bytes([y_val]) * STAMP_BLOCK_W
 
     return True
+
+
+def _as_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_latency_report_filepath(server_received_unix_ms: float, report_id: str) -> str:
+    sec = int(server_received_unix_ms // 1000)
+    ms = int(server_received_unix_ms % 1000)
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(sec))
+    short_id = (report_id or str(uuid.uuid4())).split("-")[0]
+    filename = f"{LATENCY_REPORT_PREFIX}_{ts}_{ms:03d}_{short_id}.csv"
+    return os.path.join(LATENCY_REPORT_DIR, filename)
+
+
+def append_latency_report_csv(record: dict) -> str:
+    os.makedirs(LATENCY_REPORT_DIR, exist_ok=True)
+    server_received_unix_ms = _as_float(record.get("server_received_unix_ms"), time.time() * 1000.0)
+    report_id = str(record.get("report_id", ""))
+    file_path = _build_latency_report_filepath(server_received_unix_ms, report_id)
+
+    with open(file_path, "w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=LATENCY_REPORT_FIELDS)
+        writer.writeheader()
+        writer.writerow({k: record.get(k, "") for k in LATENCY_REPORT_FIELDS})
+
+    return file_path
+
+
+def count_latency_reports() -> int:
+    if not os.path.isdir(LATENCY_REPORT_DIR):
+        return 0
+    total = 0
+    for name in os.listdir(LATENCY_REPORT_DIR):
+        if name.startswith(f"{LATENCY_REPORT_PREFIX}_") and name.endswith(".csv"):
+            total += 1
+    return total
 
 
 def set_gimbal_sync(yaw: float, pitch: float):
@@ -1297,6 +1371,85 @@ def latency_video_stamp():
         latency_video_stamp_enabled = enabled
 
     return jsonify({"enabled": latency_video_stamp_enabled})
+
+
+@app.route("/latency/report", methods=["POST"])
+def latency_report():
+    """写入一次时延测试汇总
+    ---
+    tags:
+      - 云台
+    description: 客户端在一次固定时长测试结束后，将汇总结果提交到服务端；服务端每次请求创建一个新的时间戳 CSV 文件。
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            client_timestamp_unix_ms:
+              type: number
+            mode:
+              type: string
+              example: panorama
+            duration_sec:
+              type: number
+            cmd_count:
+              type: integer
+            mech_count:
+              type: integer
+            video_count:
+              type: integer
+            render_count:
+              type: integer
+            t_cmd_mean_ms:
+              type: number
+            t_mech_mean_ms:
+              type: number
+            t_video_mean_ms:
+              type: number
+            t_render_mean_ms:
+              type: number
+            t_mtp_mean_ms:
+              type: number
+            t_mtp_p95_ms:
+              type: number
+    responses:
+      200:
+        description: 写入成功
+    """
+    data = request.get_json(force=True) if request.data else {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "invalid payload"}), 400
+
+    record = {
+        "report_id": str(uuid.uuid4()),
+        "server_received_unix_ms": round(time.time() * 1000.0, 3),
+        "client_timestamp_unix_ms": _as_float(data.get("client_timestamp_unix_ms"), 0.0),
+        "mode": str(data.get("mode", "panorama")),
+        "duration_sec": _as_float(data.get("duration_sec"), 0.0),
+        "cmd_count": _as_int(data.get("cmd_count"), 0),
+        "mech_count": _as_int(data.get("mech_count"), 0),
+        "video_count": _as_int(data.get("video_count"), 0),
+        "render_count": _as_int(data.get("render_count"), 0),
+        "t_cmd_mean_ms": _as_float(data.get("t_cmd_mean_ms"), 0.0),
+        "t_mech_mean_ms": _as_float(data.get("t_mech_mean_ms"), 0.0),
+        "t_video_mean_ms": _as_float(data.get("t_video_mean_ms"), 0.0),
+        "t_render_mean_ms": _as_float(data.get("t_render_mean_ms"), 0.0),
+        "t_mtp_mean_ms": _as_float(data.get("t_mtp_mean_ms"), 0.0),
+        "t_mtp_p95_ms": _as_float(data.get("t_mtp_p95_ms"), 0.0),
+    }
+
+    with latency_report_lock:
+        csv_path = append_latency_report_csv(record)
+        total = count_latency_reports()
+
+    return jsonify({
+        "ok": True,
+        "report_id": record["report_id"],
+        "total_reports": total,
+        "csv_path": os.path.abspath(csv_path),
+    })
 
 @app.route("/gimbal/delta", methods=["POST"])
 def gimbal_delta():
