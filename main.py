@@ -97,6 +97,7 @@ LATENCY_REPORT_DB = os.environ.get(
   os.path.join(os.path.dirname(__file__), "mtp_latency_reports.db"),
 )
 LATENCY_REPORT_TABLE = "latency_reports"
+LATENCY_RAW_TABLE = "latency_report_samples"
 latency_report_lock = threading.Lock()
 LATENCY_REPORT_FIELDS = [
     "report_id",
@@ -231,7 +232,9 @@ def _as_int(value, default=0):
 
 def _get_latency_report_conn() -> sqlite3.Connection:
   os.makedirs(os.path.dirname(LATENCY_REPORT_DB) or ".", exist_ok=True)
-  return sqlite3.connect(LATENCY_REPORT_DB, timeout=5.0)
+  conn = sqlite3.connect(LATENCY_REPORT_DB, timeout=5.0)
+  conn.execute("PRAGMA foreign_keys = ON")
+  return conn
 
 
 def init_latency_report_db():
@@ -262,9 +265,57 @@ def init_latency_report_db():
       f"CREATE INDEX IF NOT EXISTS idx_{LATENCY_REPORT_TABLE}_server_time "
       f"ON {LATENCY_REPORT_TABLE}(server_received_unix_ms)"
     )
+    conn.execute(
+      f"""
+      CREATE TABLE IF NOT EXISTS {LATENCY_RAW_TABLE} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_id TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        sample_index INTEGER NOT NULL,
+        value_ms REAL NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(report_id) REFERENCES {LATENCY_REPORT_TABLE}(report_id) ON DELETE CASCADE
+      )
+      """
+    )
+    conn.execute(
+      f"CREATE INDEX IF NOT EXISTS idx_{LATENCY_RAW_TABLE}_report_metric "
+      f"ON {LATENCY_RAW_TABLE}(report_id, metric, sample_index)"
+    )
 
 
-def insert_latency_report(record: dict):
+def _normalize_raw_samples(raw_payload):
+  if not isinstance(raw_payload, dict):
+    return []
+
+  metric_map = {
+    "t_cmd_up_ms": "cmd_up",
+    "t_mech_ms": "mechanical",
+    "t_video_down_ms": "video_down",
+    "t_render_ms": "render",
+    "t_mtp_approx_ms": "mtp_approx",
+  }
+
+  rows = []
+  for raw_key, metric_name in metric_map.items():
+    values = raw_payload.get(raw_key)
+    if not isinstance(values, list):
+      continue
+
+    for sample_idx, sample in enumerate(values):
+      try:
+        value_ms = float(sample)
+      except (TypeError, ValueError):
+        continue
+
+      if value_ms < 0.0 or value_ms > 10_000.0:
+        continue
+      rows.append((metric_name, sample_idx, value_ms))
+
+  return rows
+
+
+def insert_latency_report(record: dict, raw_rows):
   with _get_latency_report_conn() as conn:
     conn.execute(
       f"""
@@ -305,10 +356,34 @@ def insert_latency_report(record: dict):
       ),
     )
 
+    if raw_rows:
+      conn.executemany(
+        f"""
+        INSERT INTO {LATENCY_RAW_TABLE} (
+          report_id,
+          metric,
+          sample_index,
+          value_ms
+        ) VALUES (?, ?, ?, ?)
+        """,
+        [
+          (str(record.get("report_id")), metric, sample_idx, value_ms)
+          for metric, sample_idx, value_ms in raw_rows
+        ],
+      )
+
+  return len(raw_rows)
+
 
 def count_latency_reports() -> int:
   with _get_latency_report_conn() as conn:
     row = conn.execute(f"SELECT COUNT(*) FROM {LATENCY_REPORT_TABLE}").fetchone()
+  return int(row[0]) if row else 0
+
+
+def count_latency_raw_samples() -> int:
+  with _get_latency_report_conn() as conn:
+    row = conn.execute(f"SELECT COUNT(*) FROM {LATENCY_RAW_TABLE}").fetchone()
   return int(row[0]) if row else 0
 
 
@@ -1463,6 +1538,29 @@ def latency_report():
               type: number
             t_mtp_p95_ms:
               type: number
+            raw_samples:
+              type: object
+              properties:
+                t_cmd_up_ms:
+                  type: array
+                  items:
+                    type: number
+                t_mech_ms:
+                  type: array
+                  items:
+                    type: number
+                t_video_down_ms:
+                  type: array
+                  items:
+                    type: number
+                t_render_ms:
+                  type: array
+                  items:
+                    type: number
+                t_mtp_approx_ms:
+                  type: array
+                  items:
+                    type: number
     responses:
       200:
         description: 写入成功
@@ -1488,16 +1586,20 @@ def latency_report():
         "t_mtp_mean_ms": _as_float(data.get("t_mtp_mean_ms"), 0.0),
         "t_mtp_p95_ms": _as_float(data.get("t_mtp_p95_ms"), 0.0),
     }
+    raw_rows = _normalize_raw_samples(data.get("raw_samples"))
 
     with latency_report_lock:
         init_latency_report_db()
-        insert_latency_report(record)
+        written_raw = insert_latency_report(record, raw_rows)
         total = count_latency_reports()
+        total_raw = count_latency_raw_samples()
 
     return jsonify({
         "ok": True,
         "report_id": record["report_id"],
         "total_reports": total,
+        "raw_samples_written": written_raw,
+        "total_raw_samples": total_raw,
         "db_path": os.path.abspath(LATENCY_REPORT_DB),
     })
 
