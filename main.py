@@ -28,6 +28,19 @@ ROOM_NAME = "my-room"
 WIDTH = 1920
 HEIGHT = 2160
 FRAME_SIZE = WIDTH * HEIGHT * 3 // 2  # I420 格式
+# ZED Mini 在 HD1080 rectified 输出下的有效单目视场角
+# 注意这不是镜头 raw/max FOV (102°x57°)，全景拼接应使用当前输出图像的rectified FOV
+ZED_MINI_HD1080_FOV_X_DEG = 66
+ZED_MINI_HD1080_FOV_Y_DEG = 40
+# 实机/客户端感知仍偏大时，降低拼接 FOV 可让全景球中的物体角尺寸变小
+PANORAMA_FOV_SCALE = float(os.environ.get("PANORAMA_FOV_SCALE", "1.0"))
+ZED_MINI_HD1080_FOV_X = math.radians(ZED_MINI_HD1080_FOV_X_DEG * PANORAMA_FOV_SCALE)
+ZED_MINI_HD1080_FOV_Y = math.radians(ZED_MINI_HD1080_FOV_Y_DEG * PANORAMA_FOV_SCALE)
+# 增大指数可让拼接更偏向每帧中心，减少重叠区域的半透明重复
+PANORAMA_BLEND_EXPONENT = float(os.environ.get("PANORAMA_BLEND_EXPONENT", "3.0"))
+PANORAMA_YAW_DEG_LIST = [-90, -45, 0, 45, 90]
+# 3行扫描牺牲部分垂直覆盖，减少上下行重复
+PANORAMA_PITCH_DEG_LIST = [-20, 10, 40]
 
 gst_exe = r"C:/Program Files/gstreamer/1.0/msvc_x86_64/bin/gst-launch-1.0"
 GST_CMD = [
@@ -977,10 +990,10 @@ def capture_grid_sequence():
         return []
 
     captured_frames = []
-    # 5列: -90 到 90
-    yaw_deg_list = [-90, -45, 0, 45, 90]
-    # 3行: 仰视 -> 平视 -> 俯视
-    pitch_deg_list = [-45, 0, 45]
+    # 5列: -90 到 90。HD1080 rectified 水平 FOV 约 66°，45° 步进保留约 21° 重叠。
+    yaw_deg_list = PANORAMA_YAW_DEG_LIST
+    # 3行: 仰视 -> 平视 -> 俯视。减少行间重复，覆盖范围略小。
+    pitch_deg_list = PANORAMA_PITCH_DEG_LIST
 
     yaw_rads = [math.radians(d) for d in yaw_deg_list]
     pitch_rads = [math.radians(d) for d in pitch_deg_list]
@@ -1013,9 +1026,9 @@ def capture_grid_sequence():
                     "yaw": yaw,
                     "pitch": pitch
                 })
-                print(f"  -> [{total_count+1}] OK (P:{math.degrees(pitch):.0f}, Y:{math.degrees(yaw):.0f})")
+                print(f"  -> [{total_count+1}] OK (P:{math.degrees(pitch):.1f}, Y:{math.degrees(yaw):.0f})")
             else:
-                print(f"  -> [{total_count+1}] 丢帧 (P:{math.degrees(pitch):.0f}, Y:{math.degrees(yaw):.0f})")
+                print(f"  -> [{total_count+1}] 丢帧 (P:{math.degrees(pitch):.1f}, Y:{math.degrees(yaw):.0f})")
 
             total_count += 1
 
@@ -1027,8 +1040,8 @@ def generate_equirectangular(
         frames,
         pano_w=4096,
         pano_h=2048,
-        fov_x=math.radians(102),
-        fov_y=math.radians(57),
+        fov_x=ZED_MINI_HD1080_FOV_X,
+        fov_y=ZED_MINI_HD1080_FOV_Y,
 ):
     """
     极速拼接：Input -> NumPy Vectorization -> cv2.remap -> Output Array
@@ -1036,7 +1049,11 @@ def generate_equirectangular(
     if not frames:
         return None
 
-    print("[Stitch] 开始生成全景图 (GPU/Vectorized)...")
+    print(
+        "[Stitch] 开始生成全景图 "
+        f"(FOV={math.degrees(fov_x):.1f}°x{math.degrees(fov_y):.1f}°, "
+        f"blend_exp={PANORAMA_BLEND_EXPONENT:.1f})..."
+    )
     st = time.time()
 
     # 建立画布 (Spherical Grid)
@@ -1060,8 +1077,6 @@ def generate_equirectangular(
 
     tan_half_fov_x = math.tan(fov_x / 2)
     tan_half_fov_y = math.tan(fov_y / 2)
-    yaw_blend_range = math.radians(45) * 1.2
-
     # 循环处理每张图 (无像素级循环)
     for i, f in enumerate(frames):
         img = f["img"]
@@ -1089,18 +1104,22 @@ def generate_equirectangular(
         u = - (pc_x / pc_z_safe) / tan_half_fov_x
         v =   (pc_y / pc_z_safe) / tan_half_fov_y
 
+        u_grid = u.reshape(pano_h, pano_w)
+        v_grid = v.reshape(pano_h, pano_w)
+
         # 映射到 UV 坐标
-        map_x = ((u * 0.5 + 0.5) * w_img).reshape(pano_h, pano_w).astype(np.float32)
-        map_y = ((0.5 - v * 0.5) * h_img).reshape(pano_h, pano_w).astype(np.float32)
+        map_x = ((u_grid * 0.5 + 0.5) * w_img).astype(np.float32)
+        map_y = ((0.5 - v_grid * 0.5) * h_img).astype(np.float32)
         pc_z = pc_z.reshape(pano_h, pano_w)
 
         # 有效性 Mask
         mask_valid = (pc_z > 0) & (map_x >= 0) & (map_x < w_img) & (map_y >= 0) & (map_y < h_img)
 
-        # 权重计算 (基于 Yaw 距离)
-        yaw_diff = np.abs(lon_grid - cam_yaw)
-        yaw_diff = np.minimum(yaw_diff, 2 * np.pi - yaw_diff) # wrap-around
-        w_map = np.maximum(0, 1.0 - (yaw_diff / yaw_blend_range))
+        # 权重计算：按当前帧成像中心到边缘的距离做双向羽化。
+        # 旧逻辑只按 yaw 混合，会在改小有效 FOV 后留下垂直方向接缝。
+        w_x = np.maximum(0, 1.0 - np.abs(u_grid))
+        w_y = np.maximum(0, 1.0 - np.abs(v_grid))
+        w_map = np.power(w_x * w_y, PANORAMA_BLEND_EXPONENT)
 
         # 综合 Mask
         final_mask = mask_valid & (w_map > 0)
