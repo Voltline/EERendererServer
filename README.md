@@ -1,6 +1,4 @@
-# HumanoidRendererServer
-
-面向人形机器人渲染的一体化 Python 服务，整合云台控制、视频流转发、全景扫描拼接与 3DGS 生成。
+# EERendererServer
 
 ## 功能概览
 
